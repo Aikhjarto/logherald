@@ -1,0 +1,78 @@
+# Configuration of logherald, for both modes; the command line overrides
+# each setting. digest: and stream: hold the settings of one mode, and may
+# override priority, include, exclude, mail and xmpp for it.
+
+# Severity, like journalctl -p: a level and everything more severe, or a
+# range FROM..TO. Levels: emerg alert crit err warning notice info debug.
+priority: warning
+
+# Messages to report whatever their severity. A rule matches if all its
+# fields match. Fields: host, program, facility, message, unit (systemd unit;
+# from the journal, or in stream mode from %jsonmesg% of imjournal messages)
+# and origin ("journal", an rsyslog file, or "stdin"). The values are Python
+# regular expressions, searched anywhere in the field.
+include:
+  - message: 'segfault|Out of memory|oom-kill'
+  - {program: '^smartd$', message: 'unreadable|uncorrectable'}
+
+# Messages to leave out, also those an include rule reports.
+exclude:
+  - {program: '^kernel$', message: 'IN=.*OUT='}
+  # - host: '^test-'
+
+mail:
+  to: [root@localhost]
+  # from: logherald@example.org
+  method: smtp             # smtp to host:port, or sendmail
+  host: localhost
+  port: 25
+  sendmail: /usr/sbin/sendmail
+
+xmpp:
+  to: []                   # JIDs, or chat rooms with chatroom: true
+  high_priority_to: []     # digest: also notified when there are more than max_lines messages
+  chatroom: false
+  # config: /etc/logherald/sendxmpp.conf   # go-sendxmpp's account
+  args: []
+  full: false              # digest: the whole digest instead of the summary
+  timeout: 120
+
+# logherald digest: the messages of a time span from the journal and rsyslog's files
+digest:
+  # The time span, in the syntax of journalctl --since/--until.
+  since: -1h
+  until: now
+  # List the messages only up to this many; above it the digest shows the
+  # table only and is sent with high priority.
+  max_lines: 100
+  top: 10
+  # Messages in the journal and in rsyslog's files within this many seconds,
+  # from the same host and program and with the same text, are counted once.
+  duplicate_window: 5
+  send_empty: false
+  subject: '[logherald] {host}: {count} message(s) {span}'
+  journal:
+    enabled: auto          # auto: if journalctl is installed
+    # --merge includes the journals of other hosts, e.g. from systemd-journal-remote
+    args: [--merge]
+  rsyslog:
+    enabled: auto          # auto: if the configuration exists
+    config: /etc/rsyslog.conf
+    # Files the configuration does not reveal, with the severities they hold:
+    # files:
+    #   - {path: '/var/log/remote/*/errors.log', priority: err}
+
+# logherald stream: batches of the messages rsyslog's omprog writes to stdin
+stream:
+  # priority: err          # e.g. only errors right away, warnings in the digest
+  # A batch is sent after max_lines messages, interval seconds after its
+  # first message, at the end of the input, and on SIGTERM, SIGINT or SIGUSR1.
+  max_lines: 20
+  interval: 300
+  # Messages kept per destination while sending fails; the oldest are dropped.
+  max_buffer: 1000
+  # auto, json (%jsonmesg%), syslog, or text (no severity: only include
+  # rules select)
+  format: auto
+  confirm: false           # --confirm in rsyslog's omprog action sets it
+  subject: '[logherald] {host}: {count} message(s)'

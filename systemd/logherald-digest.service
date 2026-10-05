@@ -1,0 +1,24 @@
+[Unit]
+Description=Send a digest of the warnings and errors of the last hour
+Documentation=https://github.com/Aikhjarto/logherald
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# root reads every journal and rsyslog's configuration and files
+ExecStart=/usr/bin/logherald digest --config /etc/logherald/config.yaml --since -1h
+Nice=10
+IOSchedulingClass=idle
+# read-only access suffices; mail goes to localhost:25 by SMTP. With
+# mail: {method: sendmail}, remove NoNewPrivileges and ProtectSystem, as
+# postfix's and exim's sendmail need setgid and write their spool.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

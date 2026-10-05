@@ -1,0 +1,1575 @@
+#!/usr/bin/python3
+# logherald - filtered log messages by mail and XMPP: hourly digests and batches from rsyslog's omprog
+#
+# Copyright (C) 2026 Thomas Wagner <wagner-thomas@gmx.at>
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Select log messages by severity and by include and exclude rules, and
+send them by mail and XMPP (go-sendxmpp), in two modes:
+
+digest  the messages of a time span from the systemd journal and from the
+        files rsyslog writes, with messages that appear in both counted once;
+        the files and their severities are read from rsyslog's configuration
+stream  the messages that arrive on stdin, as rsyslog's omprog writes them,
+        sent in batches: after a number of messages, a number of seconds
+        after the first one, at the end of the input, and on a signal
+"""
+
+import argparse
+import bz2
+import collections
+import datetime
+import email.message
+import email.utils
+import glob
+import gzip
+import json
+import lzma
+import os
+import re
+import select
+import shlex
+import shutil
+import signal
+import smtplib
+import socket
+import subprocess
+import sys
+import time
+
+VERSION = "0.1"
+
+LEVELS = ["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"]
+LEVEL_ALIASES = {"emergency": 0, "panic": 0, "critical": 2, "error": 3, "warn": 4, "informational": 6}
+ALL_LEVELS = frozenset(range(8))
+FACILITIES = ["kern", "user", "mail", "daemon", "auth", "syslog", "lpr", "news", "uucp", "cron", "authpriv",
+              "ftp", "ntp", "security", "console", "clock"] + ["local%d" % n for n in range(8)]
+
+# settings of both modes; a mode's section may override them
+COMMON = ("priority", "include", "exclude", "mail", "xmpp")
+
+DEFAULTS = {
+    "priority": "warning",
+    "include": [],
+    "exclude": [],
+    "mail": {"to": [], "from": None, "method": "smtp", "host": "localhost", "port": 25,
+             "sendmail": "/usr/sbin/sendmail"},
+    "xmpp": {"to": [], "high_priority_to": [], "chatroom": False, "config": None,
+             "go_sendxmpp": "go-sendxmpp", "args": [], "full": False, "timeout": 120},
+    "digest": {
+        "since": "-1h",
+        "until": "now",
+        "max_lines": 100,
+        "top": 10,
+        "duplicate_window": 5,
+        "send_empty": False,
+        "subject": "[logherald] {host}: {count} message(s) {span}",
+        "journal": {"enabled": "auto", "journalctl": "journalctl", "args": ["--merge"]},
+        "rsyslog": {"enabled": "auto", "config": "/etc/rsyslog.conf", "files": []},
+    },
+    "stream": {
+        "max_lines": 20,
+        "interval": 300,
+        "max_buffer": 1000,
+        "format": "auto",
+        "confirm": False,
+        "subject": "[logherald] {host}: {count} message(s)",
+    },
+}
+
+
+class HeraldError(Exception):
+    pass
+
+
+def warn(text):
+    sys.stderr.write("logherald: %s\n" % text)
+    sys.stderr.flush()
+
+
+# ---------------------------------------------------------------------------
+# severities and time stamps, in the syntax of journalctl
+# ---------------------------------------------------------------------------
+
+def parse_level(text):
+    value = str(text).strip().lower()
+    if value.isdigit() and int(value) <= 7:
+        return int(value)
+    if value in LEVELS:
+        return LEVELS.index(value)
+    if value in LEVEL_ALIASES:
+        return LEVEL_ALIASES[value]
+    raise ValueError("unknown severity %r" % text)
+
+
+def parse_priority(text):
+    """The levels journalctl -p selects: LEVEL and everything more severe, or FROM..TO."""
+    value = str(text)
+    if ".." in value:
+        first, last = (parse_level(part) for part in value.split("..", 1))
+        return frozenset(range(min(first, last), max(first, last) + 1))
+    return frozenset(range(0, parse_level(value) + 1))
+
+
+def level_label(entry):
+    if entry.priority is None:
+        return "?"
+    return LEVELS[entry.priority] + ("+" if entry.approximate else "")
+
+
+TIME_UNITS = [
+    (("usec", "us", "µs"), 1e-6), (("msec", "ms"), 1e-3),
+    (("seconds", "second", "sec", "s"), 1), (("minutes", "minute", "min", "m"), 60),
+    (("hours", "hour", "hr", "h"), 3600), (("days", "day", "d"), 86400),
+    (("weeks", "week", "w"), 604800), (("months", "month", "M"), 2629800),
+    (("years", "year", "y"), 31557600),
+]
+UNIT_SECONDS = {name: seconds for names, seconds in TIME_UNITS for name in names}
+
+
+def parse_span(text):
+    """A time span of systemd.time(7), e.g. "1h 30min" or "2days"."""
+    total = 0.0
+    found = False
+    for number, unit in re.findall(r"(\d+(?:\.\d+)?)\s*([a-zA-Zµ]*)", text):
+        unit = unit or "s"
+        seconds = UNIT_SECONDS.get(unit, UNIT_SECONDS.get(unit.lower()))
+        if seconds is None:
+            raise ValueError("unknown time unit %r" % unit)
+        total += float(number) * seconds
+        found = True
+    if not found or re.sub(r"[\d.\sa-zA-Zµ]", "", text):
+        raise ValueError("invalid time span %r" % text)
+    return total
+
+
+def parse_time_fallback(text, now):
+    """The common forms of systemd.time(7), for systems without systemd-analyze."""
+    value = text.strip()
+    today = datetime.datetime.fromtimestamp(now).replace(hour=0, minute=0, second=0, microsecond=0)
+    words = {"now": now, "today": today.timestamp(),
+             "yesterday": (today - datetime.timedelta(days=1)).timestamp(),
+             "tomorrow": (today + datetime.timedelta(days=1)).timestamp()}
+    if value in words:
+        return words[value]
+    if value.startswith("@"):
+        return float(value[1:])
+    if value[:1] in "+-":
+        return now + (1 if value[0] == "+" else -1) * parse_span(value[1:])
+    if value.endswith(" ago"):
+        return now - parse_span(value[:-4])
+    if value.endswith(" left"):
+        return now + parse_span(value[:-5])
+    # an optional weekday in front, as systemd prints it
+    value = re.sub(r"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\s+", "", value)
+    for pattern in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.datetime.strptime(value, pattern).timestamp()
+        except ValueError:
+            pass
+    for pattern in ("%H:%M:%S", "%H:%M"):
+        try:
+            clock = datetime.datetime.strptime(value, pattern)
+        except ValueError:
+            continue
+        return today.replace(hour=clock.hour, minute=clock.minute, second=clock.second).timestamp()
+    raise ValueError("cannot parse time %r" % text)
+
+
+def parse_time(text, now):
+    """A time stamp in the syntax of journalctl --since/--until, as seconds since the epoch.
+
+    systemd-analyze timestamp understands exactly that syntax; without it a
+    reimplementation of its common forms is used.
+    """
+    text = str(text)
+    if text == "now":
+        return now
+    exe = shutil.which("systemd-analyze")
+    if exe:
+        try:
+            result = subprocess.run([exe, "timestamp", "--", text], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    universal_newlines=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            result = None
+        if result is not None:
+            match = re.search(r"UNIX seconds:\s*@(\d+(?:\.\d+)?)", result.stdout)
+            if result.returncode == 0 and match:
+                return float(match.group(1))
+            if result.returncode != 0:
+                raise ValueError("cannot parse time %r: %s" % (text, result.stderr.strip() or "invalid"))
+    return parse_time_fallback(text, now)
+
+
+def format_time(seconds):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(seconds))
+
+
+# ---------------------------------------------------------------------------
+# messages and filter rules
+# ---------------------------------------------------------------------------
+
+class Entry:
+    __slots__ = ("time", "host", "program", "pid", "message", "priority", "approximate", "origin", "unit",
+                 "facility")
+
+    def __init__(self, time, host, program, pid, message, priority, origin, approximate=False, unit="",
+                 facility=""):
+        self.time = time
+        self.host = host
+        self.program = program
+        self.pid = pid
+        self.message = message
+        self.priority = priority
+        self.approximate = approximate
+        self.origin = origin
+        self.unit = unit
+        self.facility = facility
+
+
+RULE_FIELDS = {
+    "host": "host", "hostname": "host",
+    "program": "program", "source": "program", "identifier": "program", "tag": "program",
+    "message": "message", "content": "message", "msg": "message",
+    "facility": "facility", "unit": "unit", "origin": "origin",
+}
+
+
+class Rule:
+    """Matches a message if every condition's regular expression is found in its field."""
+
+    def __init__(self, conditions, text):
+        self.conditions = conditions
+        self.text = text
+
+    def matches(self, entry):
+        return all(regex.search(getattr(entry, field) or "") for field, regex in self.conditions)
+
+
+def parse_rule(value):
+    """A rule from YAML (a mapping of fields to regular expressions) or the command line (FIELD=REGEX)."""
+    if isinstance(value, str):
+        field, sep, regex = value.partition("=")
+        if not sep:
+            raise ValueError("a rule is FIELD=REGEX, not %r" % value)
+        value = {field.strip(): regex}
+    if not isinstance(value, dict) or not value:
+        raise ValueError("a rule needs at least one of %s" % ", ".join(sorted(set(RULE_FIELDS.values()))))
+    conditions = []
+    for field, regex in value.items():
+        name = RULE_FIELDS.get(str(field).strip().lower())
+        if name is None:
+            raise ValueError("unknown field %r in rule, use %s" % (field, ", ".join(sorted(set(RULE_FIELDS.values())))))
+        try:
+            conditions.append((name, re.compile(str(regex))))
+        except re.error as err:
+            raise ValueError("invalid regular expression %r: %s" % (regex, err))
+    return Rule(conditions, ", ".join("%s=%s" % (field, regex) for field, regex in value.items()))
+
+
+def selected(entry, levels, include, exclude):
+    if any(rule.matches(entry) for rule in exclude):
+        return False
+    if any(rule.matches(entry) for rule in include):
+        return True
+    return entry.priority is not None and entry.priority in levels
+
+
+# ---------------------------------------------------------------------------
+# syslog lines, as rsyslog writes them to files or to omprog
+# ---------------------------------------------------------------------------
+
+MONTHS = {name: number for number, name in enumerate(
+    ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"), 1)}
+RFC5424_RE = re.compile(r"^<(?P<pri>\d{1,3})>1 (?P<ts>\S+) (?P<host>\S+) (?P<app>\S+) (?P<procid>\S+) \S+ "
+                        r"(?:-|(?:\[(?:[^\]\\]|\\.)*\])+) ?(?P<msg>.*)$")
+LINE_RE = re.compile(r"^(?:<(?P<pri>\d{1,3})>)?(?:(?P<ts>\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?"
+                     r"(?:Z|[+-]\d\d:?\d\d)|[A-Z][a-z]{2} [ \d]\d \d\d:\d\d:\d\d) )?(?P<host>\S+) ?(?P<rest>.*)$")
+TAG_RE = re.compile(r"^(?P<program>[^\s\[\]:]+)(?:\[(?P<pid>[^\]]*)\])?:\s?(?P<msg>.*)$")
+
+
+def rfc3339_time(text):
+    text = text.replace("Z", "+00:00")
+    match = re.match(r"^(.*?T\d\d:\d\d:\d\d)(\.\d+)?([+-]\d\d):?(\d\d)$", text)
+    if not match:
+        raise ValueError(text)
+    head, fraction, hours, minutes = match.groups()
+    fraction = (fraction or ".0")[:7]
+    return datetime.datetime.fromisoformat("%s%s%s:%s" % (head, fraction, hours, minutes)).timestamp()
+
+
+def traditional_time(text, until):
+    """A time stamp like 'Oct  2 18:28:01', in local time, of the year that puts it before until."""
+    month, day, clock = text.split()
+    hour, minute, second = (int(part) for part in clock.split(":"))
+    year = time.localtime(until).tm_year
+    stamp = datetime.datetime(year, MONTHS[month], int(day), hour, minute, second).timestamp()
+    if stamp > until + 2 * 86400:
+        stamp = datetime.datetime(year - 1, MONTHS[month], int(day), hour, minute, second).timestamp()
+    return stamp
+
+
+def from_pri(pri):
+    """Facility name and severity of a syslog PRI."""
+    pri = int(pri)
+    facility = pri >> 3
+    return (FACILITIES[facility] if facility < len(FACILITIES) else str(facility)), pri & 7
+
+
+def parse_line(line, until):
+    """A syslog line as an entry without origin, or None if it is not one.
+
+    RFC 5424, or a time stamp (BSD or RFC 3339) and host name, optionally
+    after a <PRI>. Only with a PRI is the severity known.
+    """
+    match = RFC5424_RE.match(line)
+    if match:
+        message = match.group("msg")
+        if message.startswith("\ufeff"):
+            message = message[1:]
+        facility, severity = from_pri(match.group("pri"))
+        host, app, procid = match.group("host", "app", "procid")
+        return Entry(rfc3339_time(match.group("ts")), "" if host == "-" else host, "" if app == "-" else app,
+                     "" if procid == "-" else procid, message, severity, "", facility=facility)
+    match = LINE_RE.match(line)
+    if not match or not (match.group("pri") or match.group("ts")):
+        return None
+    stamp = match.group("ts")
+    if stamp is None:
+        when = until
+    else:
+        when = rfc3339_time(stamp) if stamp[0].isdigit() else traditional_time(stamp, until)
+    rest = match.group("rest")
+    tag = TAG_RE.match(rest)
+    if tag:
+        program, pid, message = tag.group("program"), tag.group("pid") or "", tag.group("msg")
+    else:
+        program, pid, message = "", "", rest
+    facility, severity = from_pri(match.group("pri")) if match.group("pri") else ("", None)
+    return Entry(when, match.group("host"), program, pid, message, severity, "", facility=facility)
+
+
+def parse_json(line, received):
+    """rsyslog's %jsonmesg% property; messages from imjournal carry the journal's fields in "$!"."""
+    data = json.loads(line)
+    if not isinstance(data, dict):
+        raise ValueError("not a JSON object")
+    severity = data.get("syslogseverity")
+    facility = data.get("syslogfacility-text") or ""
+    if severity is None and data.get("pri") is not None:
+        facility_name, severity = from_pri(data["pri"])
+        facility = facility or facility_name
+    try:
+        stamp = rfc3339_time(data["timereported"]) if data.get("timereported") else received
+    except ValueError:
+        stamp = received
+    procid = str(data.get("procid") or "")
+    local = data.get("$!") if isinstance(data.get("$!"), dict) else {}
+    return Entry(stamp, data.get("hostname") or data.get("fromhost") or "",
+                 data.get("programname") or data.get("app-name") or "", "" if procid == "-" else procid,
+                 str(data.get("msg", "")).strip(), int(severity) if severity is not None else None, "stdin",
+                 unit=str(local.get("_SYSTEMD_UNIT") or ""), facility=facility)
+
+
+def parse_stream_line(line, received, fmt):
+    """One line of the stream; a line in no known format has no severity."""
+    line = line.rstrip("\r\n")
+    if not line.strip():
+        return None
+    if fmt in ("auto", "json") and line.lstrip().startswith("{"):
+        try:
+            return parse_json(line, received)
+        except ValueError:
+            if fmt == "json":
+                raise
+    if fmt in ("auto", "syslog"):
+        try:
+            entry = parse_line(line, received)
+        except (ValueError, KeyError, OverflowError):
+            entry = None
+        if entry is not None:
+            entry.origin = "stdin"
+            return entry
+    return Entry(received, "", "", "", line, None, "stdin")
+
+
+# ---------------------------------------------------------------------------
+# the journal
+# ---------------------------------------------------------------------------
+
+def field_text(value):
+    """A journal field: a string, or a list of byte values for binary content."""
+    if isinstance(value, list):
+        if all(isinstance(item, int) for item in value):
+            return bytes(value).decode("utf-8", "replace")
+        return field_text(value[0]) if value else ""
+    return "" if value is None else str(value)
+
+
+def read_journal(config, since, until, levels, all_levels):
+    """The journal entries of the time span; all levels if include rules need them."""
+    command = [config["journalctl"], "-o", "json", "--no-pager", "-q",
+               "--since", "@%.6f" % since, "--until", "@%.6f" % until] + [str(arg) for arg in config["args"]]
+    if not all_levels:
+        command += ["-p", "%d..%d" % (min(levels), max(levels))]
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as err:
+        raise HeraldError("cannot run %s: %s" % (config["journalctl"], err.strerror))
+    entries = []
+    for line in process.stdout:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        try:
+            stamp = int(record["__REALTIME_TIMESTAMP"]) / 1e6
+        except (KeyError, ValueError):
+            continue
+        program = field_text(record.get("SYSLOG_IDENTIFIER")) or field_text(record.get("_COMM"))
+        if not program and record.get("_TRANSPORT") == "kernel":
+            program = "kernel"
+        try:
+            priority = int(field_text(record.get("PRIORITY")) or 6)
+        except ValueError:
+            priority = 6
+        facility = field_text(record.get("SYSLOG_FACILITY"))
+        if facility.isdigit() and int(facility) < len(FACILITIES):
+            facility = FACILITIES[int(facility)]
+        entries.append(Entry(stamp, field_text(record.get("_HOSTNAME")), program,
+                             field_text(record.get("SYSLOG_PID")) or field_text(record.get("_PID")),
+                             field_text(record.get("MESSAGE")), priority, "journal",
+                             unit=field_text(record.get("_SYSTEMD_UNIT")), facility=facility))
+    stderr = process.stderr.read().decode("utf-8", "replace").strip()
+    if process.wait() != 0:
+        raise HeraldError("%s failed: %s" % (config["journalctl"], stderr or "exit code %d" % process.returncode))
+    return entries
+
+
+# ---------------------------------------------------------------------------
+# rsyslog's configuration: which files it writes, with which severities
+# ---------------------------------------------------------------------------
+
+SELECTOR = r"[\w*]+(?:,[\w*]+)*\.!?=?[\w*]+"
+SELECTOR_RE = re.compile(r"^(%s(?:;\s*%s)*)\s+(.+)$" % (SELECTOR, SELECTOR), re.S)
+PARAM_RE = re.compile(r"""([\w.-]+)\s*=\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')""")
+IGNORED_STATEMENTS = re.compile(r"^(module|input|global|main_queue|lookup_table|parser|timezone|license|set|unset|"
+                                r"call|reset|foreach|dyn_stats|percentile_stats|ratelimit)\b", re.I)
+
+
+def selector_levels(selector):
+    """The severities a legacy selector such as *.*;mail.none or *.=warning;*.=err lets through."""
+    per_facility = collections.defaultdict(set)
+    for part in selector.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        facilities, _, spec = part.rpartition(".")
+        names = FACILITIES if "*" in facilities.split(",") else [name.strip() for name in facilities.split(",")]
+        negate = spec.startswith("!")
+        spec = spec.lstrip("!")
+        exact = spec.startswith("=")
+        spec = spec.lstrip("=")
+        if spec == "none":
+            for name in names:
+                per_facility[name] = set()
+            continue
+        if spec == "*":
+            chosen = set(ALL_LEVELS)
+        else:
+            level = parse_level(spec)
+            chosen = {level} if exact else set(range(0, level + 1))
+        for name in names:
+            if negate:
+                per_facility[name] -= chosen
+            else:
+                per_facility[name] |= chosen
+    result = set()
+    for levels in per_facility.values():
+        result |= levels
+    return frozenset(result)
+
+
+def condition_levels(condition):
+    """The severities an if condition lets through; all of them unless it is a plain conjunction."""
+    if re.search(r"\bor\b|\bnot\b", condition):
+        return ALL_LEVELS
+    levels = set(ALL_LEVELS)
+    for match in re.finditer(r"\$syslogseverity(?:-text)?\s*(==|!=|<=|>=|<|>)\s*['\"]?(\w+)['\"]?", condition):
+        operator, value = match.groups()
+        try:
+            level = parse_level(value)
+        except ValueError:
+            return ALL_LEVELS
+        allowed = {"==": {level}, "!=": ALL_LEVELS - {level}, "<=": set(range(0, level + 1)),
+                   "<": set(range(0, level)), ">=": set(range(level, 8)), ">": set(range(level + 1, 8))}[operator]
+        levels &= allowed
+    for match in re.finditer(r"prifilt\(\s*['\"]([^'\"]+)['\"]\s*\)", condition):
+        try:
+            levels &= selector_levels(match.group(1))
+        except ValueError:
+            return ALL_LEVELS
+    return frozenset(levels)
+
+
+def strip_comments(text):
+    """rsyslog's configuration without # and /* */ comments, outside of quoted strings."""
+    out = []
+    index = 0
+    quote = None
+    while index < len(text):
+        char = text[index]
+        if quote:
+            out.append(char)
+            if char == "\\" and index + 1 < len(text):
+                out.append(text[index + 1])
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+            index += 1
+        elif char == '"':
+            quote = char
+            out.append(char)
+            index += 1
+        elif char == "#":
+            end = text.find("\n", index)
+            index = len(text) if end < 0 else end
+        elif text.startswith("/*", index) and not (index and (text[index - 1].isalnum() or text[index - 1] in "._-/")):
+            # a comment, unlike the glob in $IncludeConfig /etc/rsyslog.d/*.conf
+            end = text.find("*/", index + 2)
+            index = len(text) if end < 0 else end + 2
+        else:
+            out.append(char)
+            index += 1
+    return "".join(out)
+
+
+def split_statements(text):
+    """Statements of rsyslog's configuration: lines, with parentheses spanning lines, braces separate."""
+    text = re.sub(r"\\[ \t]*\n", " ", text)
+    statements = []
+    buffer = []
+    depth = 0
+    quote = None
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote:
+            buffer.append(char)
+            if char == "\\" and index + 1 < len(text):
+                buffer.append(text[index + 1])
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+        elif char == '"':
+            quote = char
+            buffer.append(char)
+        elif char == "(":
+            depth += 1
+            buffer.append(char)
+        elif char == ")":
+            depth = max(0, depth - 1)
+            buffer.append(char)
+        elif depth == 0 and char in "{}\n":
+            statement = "".join(buffer).strip()
+            if statement:
+                statements.append(statement)
+            buffer = []
+            if char != "\n":
+                statements.append(char)
+        else:
+            buffer.append(char)
+        index += 1
+    statement = "".join(buffer).strip()
+    if statement:
+        statements.append(statement)
+    return statements
+
+
+def parameters(text):
+    return {key.lower(): (double if double is not None else single) for key, double, single in PARAM_RE.findall(text)}
+
+
+class RsyslogConfig:
+    """The files rsyslog's configuration writes, each with the severities it can hold."""
+
+    def __init__(self, path):
+        self.templates = {}
+        self.targets = collections.OrderedDict()   # file or glob -> set of levels
+        self.problems = []
+        self._last_levels = ALL_LEVELS
+        self._depth = 0
+        self._read(path, ALL_LEVELS, required=True)
+
+    def _read(self, path, levels, required=False):
+        if self._depth > 20:
+            self.problems.append("rsyslog includes nest too deeply at %s" % path)
+            return
+        try:
+            with open(path, encoding="utf-8", errors="replace") as handle:
+                text = handle.read()
+        except OSError as err:
+            if required:
+                raise HeraldError("cannot read %s: %s" % (path, err.strerror))
+            self.problems.append("cannot read %s: %s" % (path, err.strerror))
+            return
+        self._depth += 1
+        try:
+            self._process(split_statements(strip_comments(text)), levels)
+        finally:
+            self._depth -= 1
+
+    def _include(self, pattern, levels):
+        if os.path.isdir(pattern):
+            paths = sorted(os.path.join(pattern, name) for name in os.listdir(pattern))
+        else:
+            paths = sorted(glob.glob(pattern))
+        for path in paths:
+            if os.path.isfile(path):
+                self._read(path, levels)
+
+    def _process(self, statements, levels):
+        stack = [levels]
+        pending = None          # levels for the block or statement that follows
+        pending_condition = None
+        for statement in statements:
+            context = stack[-1]
+            if statement == "{":
+                stack.append(pending if pending is not None else context)
+                pending = None
+                continue
+            if statement == "}":
+                if len(stack) > 1:
+                    stack.pop()
+                pending = None
+                continue
+            if pending_condition is not None:
+                statement = "if " + pending_condition + " " + statement
+                pending_condition = None
+            lower = statement.lower()
+            if re.match(r"^if\b", lower):
+                match = re.search(r"\bthen\b", statement)
+                if not match:
+                    pending_condition = statement[2:]
+                    continue
+                allowed = condition_levels(statement[2:match.start()]) & context
+                rest = statement[match.end():].strip()
+                if rest:
+                    self._statement(rest, allowed)
+                else:
+                    pending = allowed
+                continue
+            if re.match(r"^else\b", lower):
+                rest = statement[4:].strip()
+                if rest:
+                    self._statement(rest, context)
+                else:
+                    pending = context
+                continue
+            if lower.startswith("ruleset("):
+                pending = context
+                continue
+            self._statement(statement, context)
+
+    def _statement(self, statement, context):
+        lower = statement.lower()
+        if statement.startswith("$"):
+            self._directive(statement, context)
+            return
+        if lower.startswith("include("):
+            path = parameters(statement).get("file")
+            if path:
+                self._include(path, context)
+            return
+        if lower.startswith("template("):
+            params = parameters(statement)
+            if params.get("name") and params.get("string") is not None:
+                self.templates[params["name"]] = params["string"]
+            return
+        if IGNORED_STATEMENTS.match(statement) or statement in ("stop", "~"):
+            return
+        if statement.startswith("&"):
+            self._action(statement[1:].strip(), self._last_levels)
+            return
+        if statement.startswith(":"):
+            # a property based filter: the severities it lets through are not known
+            match = re.match(r'^:\s*[^,]+,\s*!?\s*[\w-]+\s*,\s*"(?:[^"\\]|\\.)*"\s*(.*)$', statement, re.S)
+            self._last_levels = context
+            if match:
+                self._action(match.group(1), context)
+            return
+        match = SELECTOR_RE.match(statement)
+        if match:
+            try:
+                levels = selector_levels(match.group(1)) & context
+            except ValueError as err:
+                self.problems.append("rsyslog selector %r: %s" % (match.group(1), err))
+                return
+            self._last_levels = levels
+            self._action(match.group(2), levels)
+            return
+        self._action(statement, context)
+
+    def _directive(self, statement, context):
+        match = re.match(r"^\$IncludeConfig\s+(\S+)", statement, re.I)
+        if match:
+            self._include(match.group(1), context)
+            return
+        match = re.match(r'^\$template\s+([^,\s]+)\s*,\s*"((?:[^"\\]|\\.)*)"', statement, re.I)
+        if match:
+            self.templates[match.group(1)] = match.group(2)
+
+    def _action(self, action, levels):
+        action = action.strip()
+        path = dynamic = None
+        match = re.match(r"^action\((.*)\)\s*$", action, re.S | re.I)
+        if match:
+            params = parameters(match.group(1))
+            if params.get("type", "").lower() != "omfile":
+                return
+            path = params.get("file")
+            dynamic = params.get("dynafile")
+        else:
+            match = re.match(r"^-?(/[^;\s]+)", action)
+            if match:
+                path = match.group(1)
+            match = re.match(r"^-?\?([^;\s]+)", action)
+            if match:
+                dynamic = match.group(1)
+        if dynamic:
+            template = self.templates.get(dynamic)
+            if template is None:
+                self.problems.append("rsyslog uses the unknown template %r as a file name" % dynamic)
+                return
+            path = re.sub(r"\*+", "*", re.sub(r"%[^%]*%", "*", template))
+        if not path or path.startswith("/dev/"):
+            return
+        if levels:
+            self.targets.setdefault(path, set()).update(levels)
+
+
+# ---------------------------------------------------------------------------
+# reading rsyslog's files
+# ---------------------------------------------------------------------------
+
+REPEATED_RE = re.compile(r"^(last message repeated \d+ times|message repeated \d+ times: \[)")
+ROTATED_RE = re.compile(r"^(?:\.\d+|-\d{8}(?:\d{2})?)(?:\.(?:gz|xz|bz2))?$")
+
+
+def log_files(pattern, since):
+    """The files of a configured file or glob, with their rotated copies, that may hold lines after since."""
+    found = []
+    for path in sorted(glob.glob(pattern)):
+        candidates = [path] + sorted(other for other in glob.glob(glob.escape(path) + "*")
+                                     if ROTATED_RE.match(other[len(path):]))
+        for candidate in candidates:
+            try:
+                if os.path.isfile(candidate) and os.path.getmtime(candidate) >= since:
+                    found.append(candidate)
+            except OSError:
+                continue
+    return found
+
+
+def open_log(path):
+    if path.endswith(".gz"):
+        return gzip.open(path, "rb")
+    if path.endswith(".xz"):
+        return lzma.open(path, "rb")
+    if path.endswith(".bz2"):
+        return bz2.open(path, "rb")
+    return open(path, "rb")
+
+
+def seek_near(handle, size, target, until):
+    """Move a plain file to shortly before the first line at target, by bisection; lines are mostly in time order."""
+    low, high = 0, size
+    while high - low > 1 << 16:
+        middle = (low + high) // 2
+        handle.seek(middle)
+        handle.readline()
+        stamp = None
+        for _ in range(50):
+            line = handle.readline()
+            if not line:
+                break
+            try:
+                parsed = parse_line(line.decode("utf-8", "replace").rstrip("\n"), until)
+            except (ValueError, KeyError, OverflowError):
+                continue
+            if parsed:
+                stamp = parsed.time
+                break
+        if stamp is None or stamp >= target:
+            high = middle
+        else:
+            low = middle
+    handle.seek(low)
+    if low:
+        handle.readline()
+
+
+def read_log_file(path, levels_of_file, levels, since, until, margin):
+    """The lines of one file between since and until, as entries.
+
+    A line's severity is its own, if the file's format includes it (<PRI>).
+    Otherwise it is known only if every severity the file can hold is
+    selected: then it is the least severe of them, marked as approximate.
+    """
+    entries = []
+    if levels_of_file <= levels:
+        file_level, approximate = max(levels_of_file), len(levels_of_file) > 1
+    else:
+        file_level, approximate = None, False
+    with open_log(path) as handle:
+        if not path.endswith((".gz", ".xz", ".bz2")):
+            seek_near(handle, os.fstat(handle.fileno()).st_size, since - margin - 600, until)
+        for raw in handle:
+            line = raw.decode("utf-8", "replace").rstrip("\n")
+            try:
+                entry = parse_line(line, until)
+            except (ValueError, KeyError, OverflowError):
+                continue
+            if entry is None:
+                continue
+            if entry.time < since - margin or entry.time > until + margin or REPEATED_RE.match(entry.message):
+                continue
+            entry.origin = path
+            if entry.priority is None:
+                entry.priority, entry.approximate = file_level, approximate
+            entries.append(entry)
+    return entries
+
+
+# ---------------------------------------------------------------------------
+# merging messages
+# ---------------------------------------------------------------------------
+
+def normalize_message(text):
+    # rsyslog writes control characters as #011 etc.
+    text = re.sub(r"#([0-3][0-7]{2})", lambda match: chr(int(match.group(1), 8)), text)
+    return " ".join(text.split())[:1000]
+
+
+def short_host(host, local):
+    return (host or local).lower().split(".")[0]
+
+
+def merge_duplicates(entries, window, local_host):
+    """Merge a message that appears in several origins (the journal, rsyslog files) into one.
+
+    Repetitions within one origin are kept: they are separate messages.
+    The journal's copy is kept, as it carries the exact severity.
+    """
+    entries = sorted(entries, key=lambda entry: (entry.time, entry.origin != "journal"))
+    kept = []
+    by_key = collections.defaultdict(list)
+    merged = 0
+    for entry in entries:
+        key = (short_host(entry.host, local_host), entry.program[:32].lower(), normalize_message(entry.message))
+        candidates = by_key[key]
+        hit = None
+        for record in reversed(candidates):
+            if entry.time - record[0].time > window:
+                break
+            if entry.origin not in record[1]:
+                hit = record
+                break
+        if hit is not None:
+            hit[1].add(entry.origin)
+            if entry.origin == "journal":
+                hit[0] = entry
+            merged += 1
+            continue
+        record = [entry, {entry.origin}]
+        candidates.append(record)
+        kept.append(record)
+    return sorted((record[0] for record in kept), key=lambda entry: entry.time), merged
+
+
+def collapse_repeats(entries, local_host):
+    """Identical messages of a batch as one: (first entry, count, time of the last), in order of appearance."""
+    groups = collections.OrderedDict()
+    for entry in entries:
+        key = (short_host(entry.host, local_host), entry.program[:32].lower(), entry.priority,
+               normalize_message(entry.message))
+        if key in groups:
+            groups[key][1] += 1
+            groups[key][2] = entry.time
+        else:
+            groups[key] = [entry, 1, entry.time]
+    return [tuple(group) for group in groups.values()]
+
+
+def format_entry(entry, local_host):
+    program = entry.program + ("[%s]" % entry.pid if entry.pid else "")
+    return "%s %s %s %s: %s" % (format_time(entry.time), entry.host or local_host, program or "?",
+                                level_label(entry), entry.message)
+
+
+# ---------------------------------------------------------------------------
+# the digest
+# ---------------------------------------------------------------------------
+
+def table(rows, header):
+    widths = [max(len(str(row[index])) for row in [header] + rows) for index in range(len(header))]
+    lines = []
+    for row in [header] + rows:
+        cells = [str(cell).rjust(width) if isinstance(cell, int) else str(cell).ljust(width)
+                 for cell, width in zip(row, widths)]
+        lines.append("  " + "  ".join(cells).rstrip())
+    return lines
+
+
+def describe_levels(levels):
+    if levels == frozenset(range(0, max(levels) + 1)):
+        return "%s or more severe" % LEVELS[max(levels)]
+    return "%s to %s" % (LEVELS[min(levels)], LEVELS[max(levels)])
+
+
+def build_digest(entries, run):
+    """Subject, full digest, short summary and whether the digest is of high priority."""
+    count = len(entries)
+    high = count > run["max_lines"]
+    span = "%s - %s" % (format_time(run["since"]), format_time(run["until"]))
+    subject = run["subject"].format(host=run["host"], count=count, span=span)
+    if high:
+        subject = "HIGH PRIORITY: " + subject
+
+    head = ["Log digest of %s for %s" % (run["host"], span),
+            "Severity: %s%s%s" % (
+                describe_levels(run["levels"]),
+                "; %d include rule(s)" % len(run["include"]) if run["include"] else "",
+                "; %d exclude rule(s)" % len(run["exclude"]) if run["exclude"] else ""),
+            "Sources: %s" % ", ".join(run["sources"]) if run["sources"] else "Sources: none"]
+    by_origin = collections.Counter("journal" if entry.origin == "journal" else "rsyslog" for entry in entries)
+    head.append("%d message(s)%s%s" % (
+        count, " (%s)" % ", ".join("%s: %d" % item for item in sorted(by_origin.items())) if by_origin else "",
+        ", %d duplicate(s) merged" % run["merged"] if run["merged"] else ""))
+    if run["problems"]:
+        head.append("")
+        head.append("Problems:")
+        head.extend("  " + problem for problem in run["problems"])
+
+    lines = list(head)
+    summary = list(head)
+    if entries:
+        counts = collections.Counter((entry.host or run["host"], entry.program or "?") for entry in entries)
+        errors = collections.Counter((entry.host or run["host"], entry.program or "?") for entry in entries
+                                     if entry.priority is not None and entry.priority <= 3)
+        ranked = sorted(counts.items(), key=lambda item: (-errors[item[0]], -item[1], item[0]))
+        rows = [[total, errors[key], key[0], key[1]] for key, total in ranked[:run["top"]]]
+        overview = ["", "Most messages by host and program:"] + table(rows, ["Count", "Errors", "Host", "Program"])
+        if len(ranked) > run["top"]:
+            overview.append("  ... and %d more" % (len(ranked) - run["top"]))
+        lines += overview
+        summary += overview
+        lines.append("")
+        if high:
+            lines.append("More than %d messages, so they are not listed. To see them:" % run["max_lines"])
+            lines.append("  logherald digest --print --since %s --until %s" % (
+                shlex.quote(format_time(run["since"])), shlex.quote(format_time(run["until"] + 1))))
+        else:
+            lines.append("Messages:")
+            lines.extend(format_entry(entry, run["host"]) for entry in entries)
+    return subject, "\n".join(lines) + "\n", "\n".join(summary) + "\n", high
+
+
+# ---------------------------------------------------------------------------
+# sending
+# ---------------------------------------------------------------------------
+
+def send_mail(config, subject, body, high, host):
+    message = email.message.EmailMessage()
+    message["From"] = config.get("from") or "logherald@%s" % host
+    message["To"] = ", ".join(config["to"])
+    message["Subject"] = subject
+    message["Date"] = email.utils.formatdate(localtime=True)
+    message["Message-ID"] = email.utils.make_msgid(domain=host)
+    message["Auto-Submitted"] = "auto-generated"
+    if high:
+        message["X-Priority"] = "1 (Highest)"
+        message["Importance"] = "high"
+        message["Priority"] = "urgent"
+    message.set_content(body)
+    if config.get("method", "smtp") == "sendmail":
+        try:
+            result = subprocess.run([config["sendmail"], "-t", "-oi"], input=message.as_bytes(),
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        except OSError as err:
+            raise HeraldError("cannot run %s: %s" % (config["sendmail"], err.strerror))
+        except subprocess.TimeoutExpired:
+            raise HeraldError("%s did not finish within 120s" % config["sendmail"])
+        if result.returncode != 0:
+            raise HeraldError("%s failed: %s" % (config["sendmail"], result.stderr.decode("utf-8", "replace").strip()))
+        return
+    try:
+        with smtplib.SMTP(config.get("host", "localhost"), int(config.get("port", 25)), timeout=60) as smtp:
+            smtp.send_message(message)
+    except (OSError, smtplib.SMTPException) as err:
+        raise HeraldError("cannot send mail via %s:%s: %s" % (config.get("host"), config.get("port"), err))
+
+
+def send_xmpp(config, recipients, text):
+    command = [config["go_sendxmpp"]]
+    if config.get("config"):
+        command += ["-f", config["config"]]
+    if config.get("chatroom"):
+        command.append("-c")
+    command += [str(arg) for arg in config.get("args") or []] + list(recipients)
+    timeout = float(config.get("timeout") or 120)
+    try:
+        result = subprocess.run(command, input=text.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                timeout=timeout)
+    except OSError as err:
+        raise HeraldError("cannot run %s: %s" % (config["go_sendxmpp"], err.strerror))
+    except subprocess.TimeoutExpired:
+        raise HeraldError("%s did not finish within %gs" % (config["go_sendxmpp"], timeout))
+    if result.returncode != 0:
+        raise HeraldError("%s failed: %s" % (config["go_sendxmpp"],
+                                             result.stderr.decode("utf-8", "replace").strip() or result.returncode))
+
+
+# ---------------------------------------------------------------------------
+# configuration
+# ---------------------------------------------------------------------------
+
+def merge_config(base, override):
+    result = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = merge_config(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def load_yaml(path):
+    try:
+        import yaml
+    except ImportError:
+        raise HeraldError("reading %s needs PyYAML (python3-PyYAML / python3-yaml)" % path)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = yaml.safe_load(handle) or {}
+    except OSError as err:
+        raise HeraldError("cannot read %s: %s" % (path, err.strerror))
+    except yaml.YAMLError as err:
+        raise HeraldError("invalid YAML in %s: %s" % (path, err))
+    if not isinstance(data, dict):
+        raise HeraldError("%s must contain a mapping" % path)
+    return data
+
+
+def mode_config(data, mode):
+    """The settings of one mode: the common ones, overridden by the mode's section."""
+    for key in data:
+        if key not in COMMON and key not in ("digest", "stream"):
+            raise HeraldError("unknown setting %r; settings of one mode go in its section, digest: or stream:" % key)
+    sections = {}
+    for name in ("digest", "stream"):
+        section = data.get(name) or {}
+        if not isinstance(section, dict):
+            raise HeraldError("%s: must be a mapping" % name)
+        for key in section:
+            if key not in COMMON and key not in DEFAULTS[name]:
+                raise HeraldError("unknown setting %r in %s:" % (key, name))
+        sections[name] = section
+    config = {key: DEFAULTS[key] for key in COMMON}
+    config = merge_config(config, {key: data[key] for key in COMMON if key in data})
+    config = merge_config(config, DEFAULTS[mode])
+    return merge_config(config, sections[mode])
+
+
+def add_common_options(parser):
+    parser.add_argument("-C", "--config", help="YAML configuration file")
+    parser.add_argument("-p", "--priority",
+                        help="severity, like journalctl -p: a level and all more severe ones, or FROM..TO "
+                             "(default: warning)")
+    parser.add_argument("--include", action="append", metavar="FIELD=REGEX",
+                        help="report messages that match, whatever their severity; FIELD is host, program, "
+                             "facility, message, unit or origin; repeatable")
+    parser.add_argument("--exclude", action="append", metavar="FIELD=REGEX",
+                        help="leave out messages that match; repeatable")
+    parser.add_argument("--mail-to", action="append", metavar="ADDRESS", help="mail recipient; repeatable")
+    parser.add_argument("--xmpp-to", action="append", metavar="JID", help="XMPP recipient; repeatable")
+    parser.add_argument("--xmpp-config", help="go-sendxmpp's configuration file")
+    parser.add_argument("-v", "--verbose", action="store_true", help="explain on stderr what is done")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="logherald",
+        description="Select log messages by severity and rules, and send them by mail and XMPP: as a digest of "
+                    "a time span from the journal and rsyslog's files, or in batches from a stream such as "
+                    "rsyslog's omprog.")
+    parser.add_argument("-V", "--version", action="version", version="logherald %s" % VERSION)
+    modes = parser.add_subparsers(dest="mode", metavar="MODE")
+    modes.required = True
+
+    digest = modes.add_parser(
+        "digest", help="a digest of a time span from the journal and the files rsyslog writes",
+        description="Send a digest of the messages of a time span from the systemd journal and the files rsyslog "
+                    "writes. Messages that appear in both are counted once.",
+        epilog="--since and --until take the syntax of journalctl, e.g. -1h, \"1 hour ago\", today, "
+               "\"2026-10-02 08:00\". Options given here override the configuration file.")
+    add_common_options(digest)
+    digest.add_argument("-S", "--since", help="start of the time span (default: -1h)")
+    digest.add_argument("-U", "--until", help="end of the time span (default: now)")
+    digest.add_argument("-n", "--max-lines", type=int,
+                        help="list the messages only up to this many, above it send with high priority (default: 100)")
+    digest.add_argument("--top", type=int, help="rows of the host and program table (default: 10)")
+    digest.add_argument("--no-journal", action="store_true", help="do not read the journal")
+    digest.add_argument("--no-rsyslog", action="store_true", help="do not read rsyslog's files")
+    digest.add_argument("--rsyslog-config", help="rsyslog's configuration (default: /etc/rsyslog.conf)")
+    digest.add_argument("--journal-arg", action="append", metavar="ARG",
+                        help="argument for journalctl instead of --merge, e.g. --directory=/var/log/journal/remote; "
+                             "repeatable")
+    digest.add_argument("--print", action="store_true", help="print the digest instead of sending it")
+    digest.add_argument("--show-sources", action="store_true",
+                        help="print the files rsyslog writes with the severities they hold, and exit")
+
+    stream = modes.add_parser(
+        "stream", help="batches of the messages arriving on stdin, e.g. from rsyslog's omprog",
+        description="Read messages from stdin, one per line, as rsyslog's omprog writes them, and send those "
+                    "that pass the filters in batches.",
+        epilog="A batch is sent after --max-lines messages, --interval seconds after its first message, at the "
+               "end of the input, and on SIGTERM, SIGINT or SIGUSR1. Options given here override the "
+               "configuration file.")
+    add_common_options(stream)
+    stream.add_argument("-n", "--max-lines", type=int, help="send after this many messages (default: 20)")
+    stream.add_argument("-s", "--interval", type=float,
+                        help="send this many seconds after the first message of a batch (default: 300)")
+    stream.add_argument("--format", choices=("auto", "json", "syslog", "text"),
+                        help="input: rsyslog's %%jsonmesg%%, syslog lines (RFC 5424, or a time stamp and host, "
+                             "optionally after <PRI>), or plain text (default: auto)")
+    stream.add_argument("--confirm", action="store_true",
+                        help="answer OK to every message, for omprog's confirmMessages=\"on\"")
+    stream.add_argument("--print", action="store_true", help="print the batches instead of sending them")
+    return parser
+
+
+def load_config(args):
+    config = mode_config(load_yaml(args.config) if args.config else {}, args.mode)
+    cli = {"priority": args.priority, "max_lines": args.max_lines}
+    if args.mode == "digest":
+        cli.update(since=args.since, until=args.until, top=args.top)
+    else:
+        cli.update(interval=args.interval, format=args.format)
+        if args.confirm:
+            config["confirm"] = True
+    config.update({key: value for key, value in cli.items() if value is not None})
+    if args.include:
+        config["include"] = list(config.get("include") or []) + args.include
+    if args.exclude:
+        config["exclude"] = list(config.get("exclude") or []) + args.exclude
+    if args.mail_to:
+        config["mail"] = dict(config["mail"], to=args.mail_to)
+    if args.xmpp_to:
+        config["xmpp"] = dict(config["xmpp"], to=args.xmpp_to)
+    if args.xmpp_config:
+        config["xmpp"] = dict(config["xmpp"], config=args.xmpp_config)
+    if args.mode == "digest":
+        if args.no_journal:
+            config["journal"] = dict(config["journal"], enabled=False)
+        if args.no_rsyslog:
+            config["rsyslog"] = dict(config["rsyslog"], enabled=False)
+        if args.rsyslog_config:
+            config["rsyslog"] = dict(config["rsyslog"], config=args.rsyslog_config)
+        if args.journal_arg:
+            config["journal"] = dict(config["journal"], args=args.journal_arg)
+    for section in ("mail", "xmpp"):
+        for key in ("to", "high_priority_to"):
+            value = config[section].get(key)
+            if isinstance(value, str):
+                config[section] = dict(config[section], **{key: [value]})
+    return config
+
+
+def filters(config):
+    try:
+        return (parse_priority(config["priority"]), [parse_rule(rule) for rule in config.get("include") or []],
+                [parse_rule(rule) for rule in config.get("exclude") or []])
+    except ValueError as err:
+        raise HeraldError(str(err))
+
+
+def enabled(value):
+    """True, False or "auto" from the configuration."""
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if value == "auto":
+            return "auto"
+        return value in ("1", "yes", "true", "on")
+    return bool(value)
+
+
+# ---------------------------------------------------------------------------
+# digest mode
+# ---------------------------------------------------------------------------
+
+def collect(config, since, until, levels, include, verbose, problems, sources):
+    entries = []
+    margin = float(config["duplicate_window"])
+
+    journal = config["journal"]
+    use_journal = enabled(journal.get("enabled", "auto"))
+    if use_journal == "auto":
+        use_journal = shutil.which(journal["journalctl"]) is not None
+    if use_journal:
+        try:
+            found = read_journal(journal, since, until, levels, bool(include))
+            entries += found
+            sources.append("journal")
+            if verbose:
+                sys.stderr.write("journal: %d entries\n" % len(found))
+        except HeraldError as err:
+            problems.append(str(err))
+
+    rsyslog = config["rsyslog"]
+    use_rsyslog = enabled(rsyslog.get("enabled", "auto"))
+    if use_rsyslog == "auto":
+        use_rsyslog = os.path.exists(rsyslog["config"])
+    if not use_rsyslog:
+        return entries
+    targets = collections.OrderedDict()
+    try:
+        parsed = RsyslogConfig(rsyslog["config"])
+        targets.update(parsed.targets)
+        problems += parsed.problems
+    except HeraldError as err:
+        problems.append(str(err))
+    for extra in rsyslog.get("files") or []:
+        try:
+            targets.setdefault(extra["path"], set()).update(parse_priority(extra.get("priority", "debug")))
+        except (KeyError, TypeError, ValueError) as err:
+            problems.append("invalid rsyslog.files entry %r: %s" % (extra, err))
+    read_any = False
+    for pattern, file_levels in targets.items():
+        if not file_levels:
+            continue
+        if not file_levels & levels and not include:
+            if verbose:
+                sys.stderr.write("rsyslog: skipping %s, it holds none of the severities\n" % pattern)
+            continue
+        for path in log_files(pattern, since - margin):
+            try:
+                found = read_log_file(path, frozenset(file_levels), levels, since, until, margin)
+            except (OSError, EOFError, lzma.LZMAError) as err:
+                problems.append("cannot read %s: %s" % (path, getattr(err, "strerror", None) or err))
+                continue
+            read_any = True
+            entries += found
+            if verbose:
+                sys.stderr.write("rsyslog: %s (%s): %d lines\n" % (
+                    path, ",".join(LEVELS[level] for level in sorted(file_levels)), len(found)))
+    if read_any or targets:
+        sources.append("rsyslog")
+    return entries
+
+
+def run_digest(args):
+    config = load_config(args)
+    host = socket.getfqdn()
+    local_short = host.split(".")[0]
+
+    if args.show_sources:
+        parsed = RsyslogConfig(config["rsyslog"]["config"])
+        for pattern, levels in parsed.targets.items():
+            print("%-40s %s" % (pattern, ",".join(LEVELS[level] for level in sorted(levels))))
+        for problem in parsed.problems:
+            print("problem: %s" % problem)
+        return 0
+
+    levels, include, exclude = filters(config)
+    try:
+        now = time.time()
+        since = parse_time(config["since"], now)
+        until = parse_time(config["until"], now)
+    except ValueError as err:
+        raise HeraldError(str(err))
+    if since > until:
+        raise HeraldError("--since is after --until")
+
+    problems = []
+    sources = []
+    entries = collect(config, since, until, levels, include, args.verbose, problems, sources)
+    entries = [entry for entry in entries if since <= entry.time <= until and selected(entry, levels, include, exclude)]
+    entries, merged = merge_duplicates(entries, float(config["duplicate_window"]), local_short)
+
+    digest = {"host": host, "since": since, "until": until, "levels": levels, "include": include,
+              "exclude": exclude, "sources": sources, "merged": merged, "problems": problems,
+              "max_lines": int(config["max_lines"]), "top": int(config["top"]), "subject": config["subject"]}
+    subject, body, summary, high = build_digest(entries, digest)
+
+    mail, xmpp = config["mail"], config["xmpp"]
+    if args.print or not (mail.get("to") or xmpp.get("to")):
+        sys.stdout.write("Subject: %s\n\n%s" % (subject, body))
+        return 0
+    if not entries and not problems and not config.get("send_empty"):
+        if args.verbose:
+            sys.stderr.write("nothing to send\n")
+        return 0
+    failures = []
+    if mail.get("to"):
+        try:
+            send_mail(mail, subject, body, high, host)
+        except HeraldError as err:
+            failures.append(str(err))
+    if xmpp.get("to"):
+        recipients = list(xmpp["to"]) + (list(xmpp.get("high_priority_to") or []) if high else [])
+        text = subject + "\n\n" + (body if xmpp.get("full") else summary)
+        try:
+            send_xmpp(xmpp, recipients, text)
+        except HeraldError as err:
+            failures.append(str(err))
+    for failure in failures:
+        warn(failure)
+    return 1 if failures else 0
+
+
+# ---------------------------------------------------------------------------
+# stream mode
+# ---------------------------------------------------------------------------
+
+def compose_batch(entries, dropped, subject, local_host):
+    """Subject and text of a batch; identical messages are listed once, with their count."""
+    hosts = sorted({entry.host or local_host for entry in entries})
+    subject = subject.format(host=", ".join(hosts) if len(hosts) <= 3 else "%d hosts" % len(hosts),
+                             count=len(entries) + dropped)
+    lines = []
+    if dropped:
+        lines.append("%d older message(s) were dropped, the buffer was full" % dropped)
+    for entry, count, last in collapse_repeats(entries, local_host):
+        line = format_entry(entry, local_host)
+        if count > 1:
+            line += " (×%d, last %s)" % (count, time.strftime("%H:%M:%S", time.localtime(last)))
+        lines.append(line)
+    return subject, "\n".join(lines) + "\n"
+
+
+class Batch:
+    """Messages waiting to be sent; each destination keeps what it could not send yet."""
+
+    def __init__(self, config, local_host, output=None):
+        self.config = config
+        self.local_host = local_host
+        self.output = output       # print the batches here instead of sending them
+        if output is not None:
+            self.destinations = ["print"]
+        else:
+            self.destinations = [name for name in ("mail", "xmpp") if config[name].get("to")]
+        self.pending = {name: [] for name in self.destinations}
+        self.dropped = {name: 0 for name in self.destinations}
+        self.first = None          # when the oldest unsent message arrived
+        self.retry_at = 0.0
+        self.failures = 0
+        self.max_buffer = int(config["max_buffer"])
+
+    def add(self, entry):
+        for name in self.destinations:
+            pending = self.pending[name]
+            pending.append(entry)
+            if len(pending) > self.max_buffer:
+                del pending[0]
+                self.dropped[name] += 1
+        if self.first is None:
+            self.first = time.monotonic()
+
+    def size(self):
+        return max((len(pending) for pending in self.pending.values()), default=0)
+
+    def waiting(self):
+        return self.size() > 0 or any(self.dropped.values())
+
+    def due(self, now):
+        """Whether to send now, and how long the main loop may wait otherwise."""
+        if not self.waiting():
+            return False, None
+        if now < self.retry_at:
+            return False, self.retry_at - now
+        if self.size() >= int(self.config["max_lines"]):
+            return True, 0
+        deadline = self.first + float(self.config["interval"])
+        return now >= deadline, max(0.0, deadline - now)
+
+    def send(self, name, subject, body):
+        if name == "print":
+            self.output.write("Subject: %s\n\n%s\n" % (subject, body))
+            self.output.flush()
+        elif name == "mail":
+            send_mail(self.config["mail"], subject, body, False, self.local_host)
+        else:
+            send_xmpp(self.config["xmpp"], self.config["xmpp"]["to"], subject + "\n\n" + body)
+
+    def flush(self):
+        """Send what is pending; returns False if a destination failed, which keeps its messages."""
+        failed = False
+        for name in self.destinations:
+            entries = self.pending[name]
+            if not entries and not self.dropped[name]:
+                continue
+            subject, body = compose_batch(entries, self.dropped[name], self.config["subject"], self.local_host)
+            try:
+                self.send(name, subject, body)
+            except HeraldError as err:
+                warn("%s: %s; %d message(s) kept" % (name, err, len(entries)))
+                failed = True
+                continue
+            self.pending[name] = []
+            self.dropped[name] = 0
+        if failed:
+            self.failures += 1
+            self.retry_at = time.monotonic() + min(30 * 2 ** (self.failures - 1), 3600)
+        else:
+            self.failures = 0
+            self.retry_at = 0.0
+        if not self.waiting():
+            self.first = None
+        return not failed
+
+
+class Streamer:
+    def __init__(self, config, stdin, stdout, print_batches=False, verbose=False):
+        self.config = config
+        self.levels, self.include, self.exclude = filters(config)
+        self.format = str(config.get("format", "auto")).lower()
+        if self.format not in ("auto", "json", "syslog", "text"):
+            raise HeraldError("format is auto, json, syslog or text, not %r" % config.get("format"))
+        self.confirm = bool(config.get("confirm"))
+        if print_batches and self.confirm:
+            raise HeraldError("--print writes to stdout, where --confirm answers omprog")
+        self.batch = Batch(config, socket.getfqdn(), stdout if print_batches else None)
+        if not self.batch.destinations:
+            raise HeraldError("no recipients: set mail: to and/or xmpp: to, or use --print")
+        self.stdin = stdin
+        self.stdout = stdout
+        self.verbose = verbose
+        self.stopping = False
+        self.flush_requested = False
+        self.partial = b""
+
+    def acknowledge(self):
+        # omprog with confirmMessages="on" waits for OK at the start and after every message
+        if self.confirm:
+            self.stdout.write("OK\n")
+            self.stdout.flush()
+
+    def handle(self, raw):
+        text = raw.decode("utf-8", "replace")
+        if self.format == "text":
+            text = text.rstrip("\r\n")
+            entry = Entry(time.time(), "", "", "", text, None, "stdin") if text.strip() else None
+        else:
+            try:
+                entry = parse_stream_line(text, time.time(), self.format)
+            except ValueError as err:
+                warn("cannot parse %r: %s" % (text[:200], err))
+                entry = None
+        if entry is not None and selected(entry, self.levels, self.include, self.exclude):
+            self.batch.add(entry)
+            if self.verbose:
+                warn("queued: %s" % format_entry(entry, self.batch.local_host))
+        self.acknowledge()
+
+    def run(self):
+        # a signal handler only sets a flag; the wakeup pipe makes select() return so the loop sees it
+        wake_read, wake_write = os.pipe()
+        os.set_blocking(wake_read, False)
+        os.set_blocking(wake_write, False)
+        old_wakeup = signal.set_wakeup_fd(wake_write)
+        handlers = {signum: signal.signal(signum, handler) for signum, handler in
+                    ((signal.SIGTERM, self.stop), (signal.SIGINT, self.stop), (signal.SIGUSR1, self.request_flush))}
+        try:
+            return self.loop(wake_read)
+        finally:
+            signal.set_wakeup_fd(old_wakeup)
+            for signum, handler in handlers.items():
+                signal.signal(signum, handler)
+            os.close(wake_read)
+            os.close(wake_write)
+
+    def loop(self, wake_read):
+        self.acknowledge()
+        fd = self.stdin.fileno()
+        while not self.stopping:
+            due, wait = self.batch.due(time.monotonic())
+            if due or self.flush_requested:
+                self.flush_requested = False
+                self.batch.flush()
+                continue
+            ready, _, _ = select.select([fd, wake_read], [], [], wait)
+            if wake_read in ready:
+                try:
+                    os.read(wake_read, 512)
+                except BlockingIOError:
+                    pass
+            if fd not in ready:
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            self.partial += chunk
+            while b"\n" in self.partial:
+                line, self.partial = self.partial.split(b"\n", 1)
+                self.handle(line)
+                if self.batch.due(time.monotonic())[0]:
+                    self.batch.flush()
+        if self.partial.strip():
+            self.handle(self.partial)
+            self.partial = b""
+        # the input ended or we were asked to stop: send what is left, once
+        if self.batch.waiting():
+            self.batch.retry_at = 0.0
+            if not self.batch.flush():
+                warn("%d message(s) could not be sent before exiting" % self.batch.size())
+                return 1
+        return 0
+
+    def stop(self, signum, frame):
+        self.stopping = True
+
+    def request_flush(self, signum, frame):
+        self.flush_requested = True
+
+
+def run_stream(args):
+    config = load_config(args)
+    streamer = Streamer(config, sys.stdin.buffer, sys.stdout, print_batches=args.print, verbose=args.verbose)
+    return streamer.run()
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def join_time_arguments(argv):
+    """Let --since -1h work as in journalctl: argparse would take -1h for an option."""
+    names = {"-S": "--since", "--since": "--since", "-U": "--until", "--until": "--until"}
+    result = []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg in names and index + 1 < len(argv):
+            result.append("%s=%s" % (names[arg], argv[index + 1]))
+            index += 2
+            continue
+        result.append(arg)
+        index += 1
+    return result
+
+
+def main(argv=None):
+    args = build_parser().parse_args(join_time_arguments(sys.argv[1:] if argv is None else list(argv)))
+    try:
+        return run_digest(args) if args.mode == "digest" else run_stream(args)
+    except HeraldError as err:
+        warn(str(err))
+        return 2
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

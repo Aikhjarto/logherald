@@ -1,0 +1,10 @@
+[Unit]
+Description=Send a digest of the warnings and errors every hour
+
+[Timer]
+OnBootSec=10min
+OnCalendar=hourly
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
