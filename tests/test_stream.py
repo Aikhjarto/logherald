@@ -1,5 +1,6 @@
 import importlib.machinery
 import importlib.util
+import datetime
 import json
 import os
 import shutil
@@ -37,6 +38,12 @@ def wait_for(condition, timeout=10):
     return False
 
 
+def rfc5424(ago, host, text, pri=27):
+    """A line as rsyslog's RSYSLOG_SyslogProtocol23Format writes it, time-stamped ago seconds back."""
+    stamp = datetime.datetime.fromtimestamp(time.time() - ago).astimezone().isoformat()
+    return "<%d>1 %s %s app - - - %s" % (pri, stamp, host, text)
+
+
 class FakeSendxmpp:
     """A go-sendxmpp that appends its arguments and stdin to a JSON lines file."""
 
@@ -44,16 +51,19 @@ class FakeSendxmpp:
         self.path = os.path.join(directory, "go-sendxmpp")
         self.log = os.path.join(directory, "sent.jsonl")
         self.fail_flag = fail_flag or os.path.join(directory, "fail")
+        self.slow_flag = os.path.join(directory, "slow")     # takes 3 seconds
         with open(self.path, "w", encoding="utf-8") as handle:
             handle.write(textwrap.dedent("""\
                 #!%s
-                import json, os, sys
+                import json, os, sys, time
+                if os.path.exists(%r):
+                    time.sleep(3)
                 if os.path.exists(%r):
                     sys.stderr.write("connection refused\\n")
                     sys.exit(1)
                 with open(%r, "a") as log:
                     log.write(json.dumps({"args": sys.argv[1:], "text": sys.stdin.read()}) + "\\n")
-                """ % (sys.executable, self.fail_flag, self.log)))
+                """ % (sys.executable, self.slow_flag, self.fail_flag, self.log)))
         os.chmod(self.path, 0o755)
 
     def sent(self):
@@ -181,6 +191,35 @@ class ParseTests(unittest.TestCase):
             batch.add(lh.Entry(0, "", "", "", str(n), 3, "stdin"))
         self.assertEqual([entry.message for entry in batch.pending["xmpp"]], ["2", "3", "4"])
         self.assertEqual(batch.dropped["xmpp"], 2)
+
+    def test_spool_round_trip(self):
+        config = lh.mode_config({"xmpp": {"to": ["x@example.org"]}, "stream": {"max_buffer": 3}}, "stream")
+        batch = lh.Batch(config, "local")
+        batch.add(lh.Entry(1.5, "web", "nginx", "42", "taken", 3, "stdin", unit="nginx.service", facility="daemon"))
+        taken = batch.take()
+        batch.add(lh.Entry(2.5, "web", "nginx", "", "pending", 3, "stdin"))
+        batch.add_stale()
+        batch.note("a note")
+        data = json.loads(json.dumps(batch.dump(taken)))
+        other = lh.Batch(config, "local")
+        other.add(lh.Entry(3, "", "", "", "new", 3, "stdin"))
+        other.add(lh.Entry(4, "", "", "", "newer", 3, "stdin"))
+        other.load(data)
+        self.assertEqual([entry.message for entry in other.pending["xmpp"]], ["pending", "new", "newer"])
+        self.assertEqual((other.dropped["xmpp"], other.stale["xmpp"], other.notes["xmpp"]), (1, 1, ["a note"]))
+        self.assertEqual(other.pending["xmpp"][0].time, 2.5)
+
+    def test_failed_send_is_put_back_first(self):
+        config = lh.mode_config({"xmpp": {"to": ["x@example.org"]}}, "stream")
+        batch = lh.Batch(config, "local")
+        batch.add(lh.Entry(0, "", "", "", "one", 3, "stdin"))
+        taken = batch.take()
+        self.assertFalse(batch.waiting())
+        batch.add(lh.Entry(0, "", "", "", "two", 3, "stdin"))
+        batch.settle(taken)
+        self.assertEqual([entry.message for entry in batch.pending["xmpp"]], ["one", "two"])
+        self.assertEqual(batch.failures, 1)
+        self.assertGreater(batch.retry_at, time.monotonic() + 20)
 
     def test_mode_config(self):
         data = {"priority": "warning", "xmpp": {"to": ["a@example.org"], "chatroom": True},
@@ -320,6 +359,106 @@ class DaemonTests(unittest.TestCase):
         self.write(process, "<27>a x: one")
         process.stdin.close()
         self.assertEqual(process.wait(10), 1)
+
+    def test_new_host_backlog(self):
+        known = os.path.join(self.dir, "state", "known-hosts")
+        process = self.start(known_hosts=known)
+        self.write(process, rfc5424(7200, "web", "old error"), rfc5424(400, "web", "older than tolerance"),
+                   rfc5424(10, "web", "recent error"), "<27>a x: no time stamp")
+        process.stdin.close()
+        self.assertEqual(process.wait(10), 0, process.stderr.read())
+        text = self.xmpp.sent()[0]["text"]
+        self.assertIn("recent error", text)
+        self.assertIn("no time stamp", text)
+        self.assertNotIn("old", text)
+        self.assertIn("new host web: its messages from before ", text)
+        self.assertEqual(sorted(line.split()[0] for line in read(known).splitlines()), ["a", "web"])
+
+    def test_known_host_backlog_is_reported(self):
+        known = os.path.join(self.dir, "known-hosts")
+        with open(known, "w", encoding="utf-8") as handle:
+            handle.write("web %d\n" % (time.time() - 86400))
+        process = self.start(known_hosts=known)
+        self.write(process, rfc5424(7200, "web.example.org", "old error"))
+        process.stdin.close()
+        self.assertEqual(process.wait(10), 0, process.stderr.read())
+        text = self.xmpp.sent()[0]["text"]
+        self.assertIn("old error", text)
+        self.assertNotIn("new host", text)
+
+    def test_backlog_only_during_the_first_hour(self):
+        known = os.path.join(self.dir, "known-hosts")
+        with open(known, "w", encoding="utf-8") as handle:
+            handle.write("web %d\n" % (time.time() - lh.BACKLOG_PERIOD - 10))
+        process = self.start(known_hosts=known)
+        self.write(process, rfc5424(lh.BACKLOG_PERIOD + 400, "web", "clock is behind"))
+        process.stdin.close()
+        self.assertEqual(process.wait(10), 0, process.stderr.read())
+        self.assertIn("clock is behind", self.xmpp.sent()[0]["text"])
+
+    def test_max_age(self):
+        process = self.start(max_age=3600)
+        self.write(process, rfc5424(7200, "web", "old error"), rfc5424(7100, "web", "old error 2"),
+                   rfc5424(10, "web", "recent error"))
+        process.stdin.close()
+        self.assertEqual(process.wait(10), 0, process.stderr.read())
+        text = self.xmpp.sent()[0]["text"]
+        self.assertIn("recent error", text)
+        self.assertNotIn("old error", text)
+        self.assertIn("2 message(s) older than 3600s were not reported", text)
+
+    def test_spool_across_restarts(self):
+        spool = os.path.join(self.dir, "state", "spool.json")
+        open(self.xmpp.fail_flag, "w").close()
+        process = self.start(spool=spool)
+        self.write(process, "<27>a x: one")
+        process.stdin.close()
+        self.assertEqual(process.wait(10), 0)
+        self.assertIn("kept in %s" % spool, process.stderr.read().decode())
+        self.assertEqual(self.xmpp.sent(), [])
+        self.assertEqual(os.stat(spool).st_mode & 0o777, 0o600)
+        os.unlink(self.xmpp.fail_flag)
+        process = self.start(spool=spool)
+        self.write(process, "<27>a x: two")
+        process.stdin.close()
+        self.assertEqual(process.wait(10), 0, process.stderr.read())
+        sent = self.xmpp.sent()
+        self.assertEqual(len(sent), 1)
+        self.assertLess(sent[0]["text"].index("one"), sent[0]["text"].index("two"))
+        self.assertFalse(os.path.exists(spool))
+
+    def test_spool_while_sending(self):
+        spool = os.path.join(self.dir, "spool.json")
+        open(self.xmpp.slow_flag, "w").close()
+        open(self.xmpp.fail_flag, "w").close()
+        process = self.start(spool=spool, max_lines=1)
+        self.write(process, "<27>a x: one")      # go-sendxmpp runs for 3 seconds, then fails
+        time.sleep(0.5)
+        process.send_signal(signal.SIGTERM)
+        self.assertTrue(wait_for(lambda: os.path.exists(spool), 2))
+        self.assertIsNone(process.poll())        # spooled before the send ends
+        self.assertIn("one", read(spool))
+        self.assertEqual(process.wait(10), 0)
+        self.assertIn("one", read(spool))
+
+    def test_reads_while_sending(self):
+        open(self.xmpp.slow_flag, "w").close()
+        process = self.start("--confirm", max_lines=1)
+        self.assertEqual(process.stdout.readline(), b"OK\n")
+        start = time.monotonic()
+        self.write(process, "<27>a x: one")      # starts a send that takes 3 seconds
+        self.assertEqual(process.stdout.readline(), b"OK\n")
+        time.sleep(0.3)
+        self.write(process, "<27>a x: two", "<27>a x: three")
+        self.assertEqual(process.stdout.readline() + process.stdout.readline(), b"OK\nOK\n")
+        self.assertLess(time.monotonic() - start, 2)
+        process.stdin.close()
+        self.assertEqual(process.wait(15), 0, process.stderr.read())
+        sent = self.xmpp.sent()
+        self.assertEqual(len(sent), 2)
+        self.assertIn("one", sent[0]["text"])
+        self.assertIn("two", sent[1]["text"])
+        self.assertIn("three", sent[1]["text"])
 
     def test_mail(self):
         smtp = FakeSMTP()

@@ -34,9 +34,10 @@ import smtplib
 import socket
 import subprocess
 import sys
+import threading
 import time
 
-VERSION = "0.1"
+VERSION = "0.2"
 
 LEVELS = ["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"]
 LEVEL_ALIASES = {"emergency": 0, "panic": 0, "critical": 2, "error": 3, "warn": 4, "informational": 6}
@@ -72,6 +73,9 @@ DEFAULTS = {
         "max_buffer": 1000,
         "format": "auto",
         "confirm": False,
+        "max_age": 0,
+        "known_hosts": None,
+        "spool": None,
         "subject": "[logherald] {host}: {count} message(s)",
     },
 }
@@ -1144,6 +1148,12 @@ def build_parser():
     stream.add_argument("--format", choices=("auto", "json", "syslog", "text"),
                         help="input: rsyslog's %%jsonmesg%%, syslog lines (RFC 5424, or a time stamp and host, "
                              "optionally after <PRI>), or plain text (default: auto)")
+    stream.add_argument("--max-age", type=float, metavar="SECONDS",
+                        help="do not report messages time-stamped longer ago (default: 0, no limit)")
+    stream.add_argument("--known-hosts", metavar="FILE",
+                        help="file of the hosts seen; a new host's backlog is not reported (default: none)")
+    stream.add_argument("--spool", metavar="FILE",
+                        help="keep unsent messages in this file across restarts (default: none)")
     stream.add_argument("--confirm", action="store_true",
                         help="answer OK to every message, for omprog's confirmMessages=\"on\"")
     stream.add_argument("--print", action="store_true", help="print the batches instead of sending them")
@@ -1156,7 +1166,8 @@ def load_config(args):
     if args.mode == "digest":
         cli.update(since=args.since, until=args.until, top=args.top)
     else:
-        cli.update(interval=args.interval, format=args.format)
+        cli.update(interval=args.interval, format=args.format, max_age=args.max_age, known_hosts=args.known_hosts,
+                   spool=args.spool)
         if args.confirm:
             config["confirm"] = True
     config.update({key: value for key, value in cli.items() if value is not None})
@@ -1333,7 +1344,13 @@ def run_digest(args):
 # stream mode
 # ---------------------------------------------------------------------------
 
-def compose_batch(entries, dropped, subject, local_host):
+# a new host's backlog: what it sends during BACKLOG_PERIOD after it was first seen, time-stamped more than
+# BACKLOG_TOLERANCE before that; the period keeps a host whose clock or time zone is off from being silenced
+BACKLOG_TOLERANCE = 300
+BACKLOG_PERIOD = 3600
+
+
+def compose_batch(entries, dropped, subject, local_host, notes=()):
     """Subject and text of a batch; identical messages are listed once, with their count."""
     hosts = sorted({entry.host or local_host for entry in entries})
     subject = subject.format(host=", ".join(hosts) if len(hosts) <= 3 else "%d hosts" % len(hosts),
@@ -1341,6 +1358,7 @@ def compose_batch(entries, dropped, subject, local_host):
     lines = []
     if dropped:
         lines.append("%d older message(s) were dropped, the buffer was full" % dropped)
+    lines += notes
     for entry, count, last in collapse_repeats(entries, local_host):
         line = format_entry(entry, local_host)
         if count > 1:
@@ -1349,8 +1367,62 @@ def compose_batch(entries, dropped, subject, local_host):
     return subject, "\n".join(lines) + "\n"
 
 
+def write_private(path, text):
+    """Replace a file atomically, readable by its owner only; creates its directory."""
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+    temporary = path + ".tmp"
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+class KnownHosts:
+    """The hosts stream mode has seen, with when it first saw each, in a file of "HOST TIME" lines."""
+
+    def __init__(self, path):
+        self.path = path
+        self.first_seen = {}
+        try:
+            with open(path, encoding="utf-8") as handle:
+                for line in handle:
+                    host, _, stamp = line.strip().partition(" ")
+                    try:
+                        self.first_seen[host] = float(stamp)
+                    except ValueError:
+                        continue
+        except FileNotFoundError:
+            pass
+        except OSError as err:
+            warn("cannot read %s: %s" % (path, err.strerror))
+
+    def see(self, host, now):
+        """When host was first seen, and whether that is now; a new host is added to the file."""
+        host = short_host(host, "")
+        if host in self.first_seen:
+            return self.first_seen[host], False
+        self.first_seen[host] = now
+        try:
+            directory = os.path.dirname(self.path)
+            if directory:
+                os.makedirs(directory, mode=0o700, exist_ok=True)
+            with open(self.path, "a", encoding="utf-8") as handle:
+                handle.write("%s %.0f\n" % (host, now))
+        except OSError as err:
+            warn("cannot write %s: %s" % (self.path, err.strerror))
+        return now, True
+
+
 class Batch:
-    """Messages waiting to be sent; each destination keeps what it could not send yet."""
+    """Messages waiting to be sent; each destination keeps what it could not send yet.
+
+    A send takes what is pending (take), sends it, possibly in a thread (deliver), and puts back what
+    failed (settle). What one destination gets is a parcel: (entries, dropped, stale, notes).
+    """
 
     def __init__(self, config, local_host, output=None):
         self.config = config
@@ -1362,7 +1434,10 @@ class Batch:
             self.destinations = [name for name in ("mail", "xmpp") if config[name].get("to")]
         self.pending = {name: [] for name in self.destinations}
         self.dropped = {name: 0 for name in self.destinations}
+        self.stale = {name: 0 for name in self.destinations}    # left out, older than max_age
+        self.notes = {name: [] for name in self.destinations}   # lines for the next batch
         self.first = None          # when the oldest unsent message arrived
+        self.taken_first = None    # the same for what take() took
         self.retry_at = 0.0
         self.failures = 0
         self.max_buffer = int(config["max_buffer"])
@@ -1376,6 +1451,15 @@ class Batch:
                 self.dropped[name] += 1
         if self.first is None:
             self.first = time.monotonic()
+
+    def add_stale(self):
+        for name in self.destinations:
+            self.stale[name] += 1
+
+    def note(self, text):
+        """A line for the next batch; it does not make one due."""
+        for name in self.destinations:
+            self.notes[name].append(text)
 
     def size(self):
         return max((len(pending) for pending in self.pending.values()), default=0)
@@ -1403,31 +1487,94 @@ class Batch:
         else:
             send_xmpp(self.config["xmpp"], self.config["xmpp"]["to"], subject + "\n\n" + body)
 
-    def flush(self):
-        """Send what is pending; returns False if a destination failed, which keeps its messages."""
-        failed = False
+    def take(self):
+        """Remove what is pending, as {destination: parcel}, to send it."""
+        parcels = {}
         for name in self.destinations:
-            entries = self.pending[name]
-            if not entries and not self.dropped[name]:
-                continue
-            subject, body = compose_batch(entries, self.dropped[name], self.config["subject"], self.local_host)
+            if self.pending[name] or self.dropped[name]:
+                parcels[name] = (self.pending[name], self.dropped[name], self.stale[name], self.notes[name])
+                self.pending[name], self.dropped[name], self.stale[name], self.notes[name] = [], 0, 0, []
+        self.taken_first, self.first = self.first, None
+        return parcels
+
+    def deliver(self, parcels):
+        """Send the parcels and return those that failed; changes nothing, so it may run in a thread."""
+        failed = {}
+        for name, (entries, dropped, stale, notes) in parcels.items():
+            if stale:
+                notes = notes + ["%d message(s) older than %gs were not reported"
+                                 % (stale, float(self.config["max_age"]))]
+            subject, body = compose_batch(entries, dropped, self.config["subject"], self.local_host, notes)
             try:
                 self.send(name, subject, body)
             except HeraldError as err:
                 warn("%s: %s; %d message(s) kept" % (name, err, len(entries)))
-                failed = True
-                continue
-            self.pending[name] = []
-            self.dropped[name] = 0
+                failed[name] = parcels[name]
+        return failed
+
+    def restore(self, name, entries, dropped, stale, notes):
+        """Put a parcel back, before what is pending; beyond max_buffer the oldest are dropped."""
+        pending = list(entries) + self.pending[name]
+        excess = len(pending) - self.max_buffer
+        if excess > 0:
+            del pending[:excess]
+            dropped += excess
+        self.pending[name] = pending
+        self.dropped[name] += dropped
+        self.stale[name] += stale
+        self.notes[name] = list(notes) + self.notes[name]
+
+    def settle(self, failed):
+        """Put back what failed, and retry after 30 seconds, then 60, 120 and so on up to an hour."""
+        for name, parcel in failed.items():
+            self.restore(name, *parcel)
         if failed:
             self.failures += 1
             self.retry_at = time.monotonic() + min(30 * 2 ** (self.failures - 1), 3600)
+            if self.taken_first is not None:
+                self.first = self.taken_first if self.first is None else min(self.first, self.taken_first)
         else:
             self.failures = 0
             self.retry_at = 0.0
+        self.taken_first = None
         if not self.waiting():
             self.first = None
+
+    def flush(self):
+        """Send what is pending; returns False if a destination failed, which keeps its messages."""
+        failed = self.deliver(self.take())
+        self.settle(failed)
         return not failed
+
+    def dump(self, sending=None):
+        """What is unsent, for the spool: what a send in progress took, then what is pending."""
+        data = {}
+        for name in self.destinations:
+            entries, dropped, stale, notes = (sending or {}).get(name, ([], 0, 0, []))
+            entries = list(entries) + self.pending[name]
+            dropped += self.dropped[name]
+            stale += self.stale[name]
+            notes = list(notes) + self.notes[name]
+            if entries or dropped or stale or notes:
+                data[name] = {"entries": [{slot: getattr(entry, slot) for slot in Entry.__slots__}
+                                          for entry in entries],
+                              "dropped": dropped, "stale": stale, "notes": notes}
+        return data
+
+    def load(self, data):
+        """Take up what dump() kept; destinations that are no longer configured are left out."""
+        for name in self.destinations:
+            item = data.get(name)
+            if not isinstance(item, dict):
+                continue
+            try:
+                entries = [Entry(**fields) for fields in item.get("entries") or []]
+                self.restore(name, entries, int(item.get("dropped") or 0), int(item.get("stale") or 0),
+                             [str(note) for note in item.get("notes") or []])
+            except (TypeError, ValueError) as err:
+                warn("invalid spooled messages for %s: %s" % (name, err))
+        if self.waiting() and self.first is None:
+            self.first = time.monotonic()
 
 
 class Streamer:
@@ -1443,12 +1590,23 @@ class Streamer:
         self.batch = Batch(config, socket.getfqdn(), stdout if print_batches else None)
         if not self.batch.destinations:
             raise HeraldError("no recipients: set mail: to and/or xmpp: to, or use --print")
+        try:
+            self.max_age = float(config.get("max_age") or 0)
+        except ValueError:
+            raise HeraldError("max_age is a number of seconds, not %r" % config.get("max_age"))
+        self.known_hosts = KnownHosts(str(config["known_hosts"])) if config.get("known_hosts") else None
+        self.spool = str(config["spool"]) if config.get("spool") else None
         self.stdin = stdin
         self.stdout = stdout
         self.verbose = verbose
         self.stopping = False
         self.flush_requested = False
         self.partial = b""
+        self.sender = None         # the thread of a send in progress
+        self.sending = None        # the parcels it sends
+        self.failed = None         # those it could not send
+        if self.spool:
+            self.read_spool()
 
     def acknowledge(self):
         # omprog with confirmMessages="on" waits for OK at the start and after every message
@@ -1457,21 +1615,100 @@ class Streamer:
             self.stdout.flush()
 
     def handle(self, raw):
+        received = time.time()
         text = raw.decode("utf-8", "replace")
         if self.format == "text":
             text = text.rstrip("\r\n")
-            entry = Entry(time.time(), "", "", "", text, None, "stdin") if text.strip() else None
+            entry = Entry(received, "", "", "", text, None, "stdin") if text.strip() else None
         else:
             try:
-                entry = parse_stream_line(text, time.time(), self.format)
+                entry = parse_stream_line(text, received, self.format)
             except ValueError as err:
                 warn("cannot parse %r: %s" % (text[:200], err))
                 entry = None
+        if entry is not None and self.backlog(entry, received):
+            entry = None
         if entry is not None and selected(entry, self.levels, self.include, self.exclude):
-            self.batch.add(entry)
-            if self.verbose:
-                warn("queued: %s" % format_entry(entry, self.batch.local_host))
+            if self.max_age and received - entry.time > self.max_age:
+                self.batch.add_stale()
+                if self.verbose:
+                    warn("too old: %s" % format_entry(entry, self.batch.local_host))
+            else:
+                self.batch.add(entry)
+                if self.verbose:
+                    warn("queued: %s" % format_entry(entry, self.batch.local_host))
         self.acknowledge()
+
+    def backlog(self, entry, received):
+        """Whether the entry belongs to the backlog of a new host, see BACKLOG_PERIOD; needs known_hosts."""
+        if self.known_hosts is None or not entry.host:
+            return False
+        first, new = self.known_hosts.see(entry.host, received)
+        if new:
+            text = "new host %s: its messages from before %s are not reported" % (
+                entry.host, format_time(first - BACKLOG_TOLERANCE))
+            warn(text)
+            self.batch.note(text)
+        return received - first < BACKLOG_PERIOD and entry.time < first - BACKLOG_TOLERANCE
+
+    def read_spool(self):
+        try:
+            with open(self.spool, encoding="utf-8") as handle:
+                data = json.load(handle)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as err:
+            warn("cannot read %s: %s" % (self.spool, err))
+            return
+        if isinstance(data, dict):
+            self.batch.load(data)
+        if self.verbose and self.batch.waiting():
+            warn("%d message(s) from %s" % (self.batch.size(), self.spool))
+
+    def write_spool(self, sending=None):
+        """Keep what is unsent in the spool, or remove it if nothing is; returns False if that failed."""
+        data = self.batch.dump(sending)
+        try:
+            if data:
+                write_private(self.spool, json.dumps(data, ensure_ascii=False))
+            else:
+                try:
+                    os.unlink(self.spool)
+                except FileNotFoundError:
+                    pass
+            return True
+        except OSError as err:
+            warn("cannot write %s: %s" % (self.spool, err))
+            return False
+
+    def start_send(self, wake_write):
+        """Send what is pending in a thread, so that stdin is read meanwhile and rsyslog is not held up."""
+        parcels = self.batch.take()
+        if not parcels:
+            return
+
+        def deliver():
+            self.failed = self.batch.deliver(parcels)
+            try:
+                os.write(wake_write, b"\0")      # wakes the main loop
+            except OSError:
+                pass
+
+        self.sending = parcels
+        self.sender = threading.Thread(target=deliver, name="send", daemon=True)
+        self.sender.start()
+
+    def finish_send(self, wait=False):
+        """Settle a send that is done, or with wait, wait for it; returns what failed, or None."""
+        if self.sender is None or (self.sender.is_alive() and not wait):
+            return None
+        self.sender.join()
+        failed = self.failed
+        self.batch.settle(failed)
+        self.sender = self.sending = self.failed = None
+        if self.spool:
+            self.write_spool()
+        return failed
 
     def run(self):
         # a signal handler only sets a flag; the wakeup pipe makes select() return so the loop sees it
@@ -1482,7 +1719,7 @@ class Streamer:
         handlers = {signum: signal.signal(signum, handler) for signum, handler in
                     ((signal.SIGTERM, self.stop), (signal.SIGINT, self.stop), (signal.SIGUSR1, self.request_flush))}
         try:
-            return self.loop(wake_read)
+            return self.loop(wake_read, wake_write)
         finally:
             signal.set_wakeup_fd(old_wakeup)
             for signum, handler in handlers.items():
@@ -1490,15 +1727,19 @@ class Streamer:
             os.close(wake_read)
             os.close(wake_write)
 
-    def loop(self, wake_read):
+    def loop(self, wake_read, wake_write):
         self.acknowledge()
         fd = self.stdin.fileno()
         while not self.stopping:
-            due, wait = self.batch.due(time.monotonic())
-            if due or self.flush_requested:
-                self.flush_requested = False
-                self.batch.flush()
-                continue
+            self.finish_send()
+            if self.sender is None:
+                due, wait = self.batch.due(time.monotonic())
+                if due or self.flush_requested:
+                    self.flush_requested = False
+                    self.start_send(wake_write)
+                    continue
+            else:
+                wait = None        # the sender wakes us when it is done
             ready, _, _ = select.select([fd, wake_read], [], [], wait)
             if wake_read in ready:
                 try:
@@ -1514,17 +1755,24 @@ class Streamer:
             while b"\n" in self.partial:
                 line, self.partial = self.partial.split(b"\n", 1)
                 self.handle(line)
-                if self.batch.due(time.monotonic())[0]:
-                    self.batch.flush()
+                if self.sender is None and self.batch.due(time.monotonic())[0]:
+                    self.start_send(wake_write)
         if self.partial.strip():
             self.handle(self.partial)
             self.partial = b""
-        # the input ended or we were asked to stop: send what is left, once
-        if self.batch.waiting():
+        # the input ended or we were asked to stop. Spool what is unsent first, in case rsyslog kills us
+        # while sending; then wait for a send in progress, or try once more
+        if self.spool:
+            self.write_spool(self.sending)
+        failed = self.finish_send(wait=True)
+        if self.batch.waiting() and not failed:
             self.batch.retry_at = 0.0
-            if not self.batch.flush():
-                warn("%d message(s) could not be sent before exiting" % self.batch.size())
-                return 1
+            self.batch.flush()
+        if self.spool and self.write_spool() and self.batch.waiting():
+            warn("%d message(s) could not be sent before exiting, kept in %s" % (self.batch.size(), self.spool))
+        elif self.batch.waiting():
+            warn("%d message(s) could not be sent before exiting" % self.batch.size())
+            return 1
         return 0
 
     def stop(self, signum, frame):

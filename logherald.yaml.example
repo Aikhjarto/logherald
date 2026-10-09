@@ -71,6 +71,17 @@ stream:
   interval: 300
   # Messages kept per destination while sending fails; the oldest are dropped.
   max_buffer: 1000
+  # Keep unsent messages in this file across restarts, e.g. while the XMPP
+  # server is down when rsyslog stops.
+  # spool: /var/lib/logherald/spool.json
+  # File of the hosts seen: during the first hour after a host was first
+  # seen, its messages from more than 5 minutes before are its backlog, such
+  # as the whole journal systemd-journal-upload sends at first, and not
+  # reported.
+  # known_hosts: /var/lib/logherald/known-hosts
+  # Do not report messages time-stamped longer ago than this many seconds;
+  # 0: no limit. Keep it well above the hosts' clock and time zone differences.
+  max_age: 0
   # auto, json (%jsonmesg%), syslog, or text (no severity: only include
   # rules select)
   format: auto

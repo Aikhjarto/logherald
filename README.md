@@ -69,10 +69,13 @@ Options of both modes:
 | `-s`, `--interval` | Send this many seconds after the first message of a batch (default: 300) |
 | `--format` | `auto`, `json`, `syslog` or `text`, see [Input](#input) (default: `auto`) |
 | `--confirm` | Answer `OK` to every message, for omprog's `confirmMessages="on"` |
+| `--max-age` | Do not report messages time-stamped longer ago than this many seconds (default: 0, no limit) |
+| `--known-hosts` | File of the hosts seen; a new host's backlog is not reported (default: none) |
+| `--spool` | Keep unsent messages in this file across restarts (default: none) |
 
 The command line overrides the configuration file. Exit status: 0; 1 if
-sending failed (for `stream`: if messages could not be sent before exiting);
-2 for an invalid configuration or command line.
+sending failed (for `stream`: if messages could not be sent before exiting,
+and no spool kept them); 2 for an invalid configuration or command line.
 
 ## Configuration
 
@@ -288,7 +291,8 @@ action(type="omprog"
   closes the pipe, sends SIGTERM, and waits up to two minutes before killing
   logherald; meanwhile the batch goes out.
 - `output`: logherald's error messages, e.g. when go-sendxmpp fails.
-- The queue keeps rsyslog's other actions running while a batch is sent.
+- The queue keeps rsyslog's other actions running should logherald fall
+  behind.
 
 To spare logherald the info and debug messages, wrap the action in
 `if $syslogseverity <= 4 then { ... }`; then its include rules see only what
@@ -312,13 +316,49 @@ Identical messages of a batch (same host, program, severity and text) are
 listed once, with their count and the time of the last. XMPP gets the subject
 as the first line and the whole batch; mail gets the batch with the subject.
 
+A batch is sent in the background: logherald keeps reading, and
+confirming, the messages rsyslog writes meanwhile, so a slow or unreachable
+XMPP or mail server does not fill omprog's queue.
+
 If go-sendxmpp or the mail fails, the messages stay and the next attempt is
 after 30 seconds, then 60, 120 and so on up to an hour; new messages are
 added meanwhile. Mail and XMPP keep their own messages, so one failing does
 not resend to the other. Each holds at most `max_buffer` messages (default
 1000); beyond that the oldest are dropped, and the next batch says how many.
-At the end of the input logherald tries once more, and exits with 1 if that
-fails.
+At the end of the input logherald waits for a batch being sent, or else
+tries once more, and exits with 1 if messages are left that no spool keeps.
+
+### Spool
+
+With `spool: /var/lib/logherald/spool.json`, the messages that could not be
+sent are kept in that file (readable by its owner only), and sent after the
+next start: a log server that boots before the XMPP server, or shuts down
+after it, then loses no notification. logherald writes the file when a send
+fails and when it exits, before it tries a last time, so that it holds the
+messages even if rsyslog kills logherald after `closeTimeout`; then a batch
+may be sent twice. The file is removed once everything is sent.
+
+### New hosts and old messages
+
+rsyslog can hand logherald old messages: a host's whole journal when
+`systemd-journal-upload` starts on it for the first time, or the journals
+again when imjournal's state file is lost. Two settings keep them from being
+reported; the messages stay in the journals and files.
+
+- `known_hosts: /var/lib/logherald/known-hosts`: a file of the hosts seen,
+  with the time each was first seen. During the first hour after a host was
+  first seen, its messages time-stamped more than 5 minutes before that are
+  its backlog, and not reported; the next batch says that there is a new
+  host. Hosts in the file are not affected: remove a host's line to treat it
+  as new again. Limiting this to an hour keeps a host whose clock or time
+  zone is off from being silenced for good.
+- `max_age: 86400`: messages time-stamped longer ago than this many seconds
+  are not reported, from any host; the next batch says how many. Choose it
+  well above the clock and time zone differences of the hosts: rsyslog
+  takes a BSD time stamp, which has no time zone, as local time.
+
+Both compare the messages' own time stamps; a line without one counts as
+received now.
 
 ## Installation
 
