@@ -31,14 +31,20 @@ def complete(*words, cwd=None):
 
 
 def help_words(*args):
-    """The option strings and modes --help lists."""
+    """The option strings and modes --help lists.
+
+    Before Python 3.13 argparse repeats the metavar after every option string
+    ("-H HOST, --host HOST"), since then only after the last ("-H, --host HOST").
+    An option line starts with the invocation, followed by the description after
+    two or more spaces or, if the invocation is long, on the next line.
+    """
     text = subprocess.run([sys.executable, SCRIPT] + list(args) + ["--help"], capture_output=True, text=True,
                           check=True).stdout
     words = set()
     for line in text.split("\n"):
-        match = re.match(r"\s{2}(-[^\s,]+(?:, -[^\s,]+)*)", line)
+        match = re.match(r"  (-\S.*?)(?:\s{2,}|$)", line)
         if match:
-            words.update(match.group(1).split(", "))
+            words.update(re.findall(r"(?:^|, )(-{1,2}[^\s,=\[]+)", match.group(1)))
         match = re.match(r"\s{4}([a-z]+)\s", line)
         if match:
             words.add(match.group(1))
