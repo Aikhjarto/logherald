@@ -37,7 +37,7 @@ import sys
 import threading
 import time
 
-VERSION = "0.2"
+VERSION = "0.3"
 
 LEVELS = ["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"]
 LEVEL_ALIASES = {"emergency": 0, "panic": 0, "critical": 2, "error": 3, "warn": 4, "informational": 6}

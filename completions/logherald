@@ -1,0 +1,82 @@
+# bash completion for logherald                              -*- shell-script -*-
+
+_logherald()
+{
+    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
+    local i=$((COMP_CWORD - 1)) eq=
+    # --option=value: bash splits at the =
+    if [[ $cur == = ]]; then
+        cur=
+        eq=1
+    elif [[ $prev == = && $COMP_CWORD -ge 2 ]]; then
+        i=$((COMP_CWORD - 2))
+        prev=${COMP_WORDS[i]}
+        eq=1
+    fi
+    COMPREPLY=()
+
+    # the rest of a value with a = in it: --include FIELD=REGEX,
+    # --journal-arg --directory=DIR
+    if [[ $eq && ($prev != -* || ${COMP_WORDS[i-1]} == --journal-arg) ]]; then
+        return
+    fi
+
+    case $prev in
+        -C | --config | --xmpp-config | --rsyslog-config | --known-hosts | --spool)
+            compopt -o filenames 2>/dev/null
+            mapfile -t COMPREPLY < <(compgen -f -- "$cur")
+            return
+            ;;
+        -p | --priority)
+            mapfile -t COMPREPLY < <(compgen -W 'emerg alert crit err warning notice info
+                debug' -- "$cur")
+            return
+            ;;
+        --include | --exclude)
+            # FIELD=REGEX
+            compopt -o nospace 2>/dev/null
+            mapfile -t COMPREPLY < <(compgen -W 'host= program= facility= message= unit=
+                origin=' -- "$cur")
+            return
+            ;;
+        --format)
+            mapfile -t COMPREPLY < <(compgen -W 'auto json syslog text' -- "$cur")
+            return
+            ;;
+        --mail-to | --xmpp-to | -S | --since | -U | --until | -n | --max-lines | --top | \
+            --journal-arg | -s | --interval | --max-age)
+            return
+            ;;
+    esac
+
+    # the mode is the first word that is not an option; the options before
+    # it take no value
+    local mode=
+    for ((i = 1; i < COMP_CWORD; i++)); do
+        if [[ ${COMP_WORDS[i]} != -* ]]; then
+            mode=${COMP_WORDS[i]}
+            break
+        fi
+    done
+
+    local options='-h --help -C --config -p --priority --include --exclude --mail-to
+        --xmpp-to --xmpp-config -v --verbose'
+    case $mode in
+        '')
+            options='-h --help -V --version digest stream'
+            ;;
+        digest)
+            options+=' -S --since -U --until -n --max-lines --top --no-journal
+                --no-rsyslog --rsyslog-config --journal-arg --print --show-sources'
+            ;;
+        stream)
+            options+=' -n --max-lines -s --interval --format --max-age --known-hosts
+                --spool --confirm --print'
+            ;;
+        *)
+            return
+            ;;
+    esac
+    mapfile -t COMPREPLY < <(compgen -W "$options" -- "$cur")
+}
+complete -F _logherald logherald

@@ -374,6 +374,16 @@ install -m 0644 data/rsyslog-logherald.conf /etc/rsyslog.d/logherald.conf
 systemctl restart rsyslog
 ```
 
+## Bash completion
+
+`completions/logherald` completes the modes, the options of each mode and
+their values. The packages install it; otherwise copy it to bash-completion's
+directory:
+
+```sh
+install -D -m 0644 completions/logherald /usr/share/bash-completion/completions/logherald
+```
+
 ## Tests
 
 ```sh
@@ -382,7 +392,8 @@ python3 -m unittest -v
 
 The tests use a fake journalctl, rsyslog configurations in the layouts of
 openSUSE and Debian, a fake SMTP server and a fake go-sendxmpp, and rsyslogd
-with omprog if it is installed.
+with omprog if it is installed. `tests/test_completion.py` checks the bash
+completion against `--help`.
 
 ## License
 
